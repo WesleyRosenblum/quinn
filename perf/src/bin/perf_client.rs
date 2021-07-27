@@ -508,6 +508,8 @@ impl Serialize for Interval {
         S: Serializer {
         let mut state = serializer.serialize_struct("Interval", 2)?;
         state.serialize_field("streams", &self.streams)?;
+        // iperf3 outputs duplicate "sum" entries when run in bidirectional mode
+        // serde does not support duplicate keys, so only output one of the sums
         if self.send_stream_sum.bytes > 0 {
             state.serialize_field("sum", &self.send_stream_sum)?;
         } else {
