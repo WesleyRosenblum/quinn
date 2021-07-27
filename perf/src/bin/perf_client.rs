@@ -342,17 +342,20 @@ async fn request(
     request_stats.upload_start = Some(Instant::now());
     send.write_all(&download.to_be_bytes()).await?;
 
+    if upload == 0 {
+        send.finish().await?;
+        return Ok(());
+    }
+
     let send_stream_stats = Arc::new(StreamStats::new(send.id(), true));
 
-    if upload > 0 {
-        stats
-            .lock()
-            .unwrap()
-            .stream_stats
-            .get_mut()
-            .unwrap()
-            .push(send_stream_stats.clone());
-    }
+    stats
+        .lock()
+        .unwrap()
+        .stream_stats
+        .get_mut()
+        .unwrap()
+        .push(send_stream_stats.clone());
 
     const DATA: [u8; 1024 * 1024] = [42; 1024 * 1024];
     while upload > 0 {
