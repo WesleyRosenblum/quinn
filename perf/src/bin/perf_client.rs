@@ -222,7 +222,11 @@ async fn run(opt: Opt) -> Result<()> {
     Ok(())
 }
 
-async fn drain_stream(mut stream: quinn::RecvStream, stats: Arc<Mutex<Stats>>, request_stats: &mut RequestStats) -> Result<()> {
+async fn drain_stream(
+    mut stream: quinn::RecvStream,
+    stats: Arc<Mutex<Stats>>,
+    request_stats: &mut RequestStats,
+) -> Result<()> {
     #[rustfmt::skip]
     let mut bufs = [
         Bytes::new(), Bytes::new(), Bytes::new(), Bytes::new(),
@@ -235,14 +239,22 @@ async fn drain_stream(mut stream: quinn::RecvStream, stats: Arc<Mutex<Stats>>, r
         Bytes::new(), Bytes::new(), Bytes::new(), Bytes::new(),
     ];
     let recv_stream_stats = Arc::new(StreamStats::new(stream.id(), false));
-    stats.lock().unwrap().stream_stats.get_mut().unwrap().push(recv_stream_stats.clone());
+    stats
+        .lock()
+        .unwrap()
+        .stream_stats
+        .get_mut()
+        .unwrap()
+        .push(recv_stream_stats.clone());
 
     while let Some(size) = stream.read_chunks(&mut bufs[..]).await? {
         if request_stats.first_byte.is_none() {
             request_stats.first_byte = Some(Instant::now());
         }
         let bytes_received = &bufs[..size].iter().map(|b| b.len()).sum();
-        recv_stream_stats.bytes.fetch_add(*bytes_received, Ordering::Relaxed);
+        recv_stream_stats
+            .bytes
+            .fetch_add(*bytes_received, Ordering::Relaxed);
     }
 
     let now = Instant::now();
@@ -275,7 +287,15 @@ async fn drive_uni(
 
         debug!("sending request on {}", send.id());
         tokio::spawn(async move {
-            if let Err(e) = request_uni(send, acceptor, upload, download, stats.clone(), &mut request_stats).await
+            if let Err(e) = request_uni(
+                send,
+                acceptor,
+                upload,
+                download,
+                stats.clone(),
+                &mut request_stats,
+            )
+            .await
             {
                 error!("sending request failed: {:#}", e);
             } else {
@@ -325,7 +345,13 @@ async fn request(
     let send_stream_stats = Arc::new(StreamStats::new(send.id(), true));
 
     if upload > 0 {
-        stats.lock().unwrap().stream_stats.get_mut().unwrap().push(send_stream_stats.clone());
+        stats
+            .lock()
+            .unwrap()
+            .stream_stats
+            .get_mut()
+            .unwrap()
+            .push(send_stream_stats.clone());
     }
 
     const DATA: [u8; 1024 * 1024] = [42; 1024 * 1024];
@@ -334,7 +360,9 @@ async fn request(
         send.write_chunk(Bytes::from_static(&DATA[..chunk_len as usize]))
             .await
             .context("sending response")?;
-        send_stream_stats.bytes.fetch_add(chunk_len as usize, Ordering::Relaxed);
+        send_stream_stats
+            .bytes
+            .fetch_add(chunk_len as usize, Ordering::Relaxed);
         upload -= chunk_len;
     }
     send.finish().await?;
@@ -364,7 +392,16 @@ async fn drive_bi(
 
         debug!("sending request on {}", send.id());
         tokio::spawn(async move {
-            if let Err(e) = request_bi(send, recv, upload, download, stats.clone(), &mut request_stats).await {
+            if let Err(e) = request_bi(
+                send,
+                recv,
+                upload,
+                download,
+                stats.clone(),
+                &mut request_stats,
+            )
+            .await
+            {
                 error!("request failed: {:#}", e);
             } else {
                 request_stats.success = true;
@@ -432,7 +469,6 @@ impl StreamStats {
             finished: Default::default(),
         }
     }
-
 }
 
 struct RequestStats {
@@ -473,14 +509,14 @@ impl Interval {
         let period = IntervalPeriod {
             start: start.as_secs_f64(),
             end: end.as_secs_f64(),
-            seconds: (end - start).as_secs_f64()
+            seconds: (end - start).as_secs_f64(),
         };
 
         Self {
             streams: vec![],
             recv_stream_sum: StreamIntervalSumStats::new(period),
             send_stream_sum: StreamIntervalSumStats::new(period),
-            period
+            period,
         }
     }
 
@@ -498,14 +534,16 @@ impl Interval {
             seconds: self.period.seconds,
             bytes,
             bits_per_second: bytes as f64 * 8.0 / self.period.seconds,
-            sender: stream_stats.sender
+            sender: stream_stats.sender,
         })
     }
 }
 
 impl Serialize for Interval {
-    fn serialize<S>(&self, serializer: S) -> Result<<S as Serializer>::Ok, <S as Serializer>::Error> where
-        S: Serializer {
+    fn serialize<S>(&self, serializer: S) -> Result<<S as Serializer>::Ok, <S as Serializer>::Error>
+    where
+        S: Serializer,
+    {
         let mut state = serializer.serialize_struct("Interval", 2)?;
         state.serialize_field("streams", &self.streams)?;
         // iperf3 outputs duplicate "sum" entries when run in bidirectional mode
@@ -555,7 +593,7 @@ impl StreamIntervalSumStats {
             end: period.end,
             seconds: period.seconds,
             bits_per_second: 0.0,
-            sender: false
+            sender: false,
         }
     }
 
@@ -571,12 +609,15 @@ struct Timestamp {
 }
 
 fn serialize_timestamp<S>(time: &SystemTime, s: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
+where
+    S: serde::Serializer,
 {
     use serde::ser::SerializeMap;
     let mut state = s.serialize_map(Some(1))?;
-    state.serialize_entry("timesecs", &time.duration_since(UNIX_EPOCH).unwrap().as_secs())?;
+    state.serialize_entry(
+        "timesecs",
+        &time.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+    )?;
     state.end()
 }
 
@@ -616,7 +657,9 @@ impl Default for Stats {
     fn default() -> Self {
         Self {
             start_instant: Instant::now(),
-            start: Timestamp { timestamp: SystemTime::now()},
+            start: Timestamp {
+                timestamp: SystemTime::now(),
+            },
             duration: Histogram::new(3).unwrap(),
             fbl: Histogram::new(3).unwrap(),
             upload_throughput: Histogram::new(3).unwrap(),
@@ -708,7 +751,7 @@ impl Stats {
 
     pub fn report_interval(&mut self, start: Instant) {
         let mut interval = Interval::new(start - self.start_instant, self.start_instant.elapsed());
-        
+
         let mut guard = self.stream_stats.lock().unwrap();
         guard.retain(|stream_stats| {
             interval.add_stream_stats(stream_stats.clone());
