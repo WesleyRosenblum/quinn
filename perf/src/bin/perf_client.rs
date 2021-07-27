@@ -251,10 +251,10 @@ async fn drain_stream(
         if request_stats.first_byte.is_none() {
             request_stats.first_byte = Some(Instant::now());
         }
-        let bytes_received = &bufs[..size].iter().map(|b| b.len()).sum();
+        let bytes_received = bufs[..size].iter().map(|b| b.len()).sum();
         recv_stream_stats
             .bytes
-            .fetch_add(*bytes_received, Ordering::Relaxed);
+            .fetch_add(bytes_received, Ordering::Relaxed);
     }
 
     let now = Instant::now();
