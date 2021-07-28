@@ -1,5 +1,6 @@
 use hdrhistogram::Histogram;
 use quinn::StreamId;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -117,8 +118,8 @@ impl Stats {
         println!();
     }
 
-    pub fn print_json(&self) {
-        json::print(&self);
+    pub fn print_json<W: Write>(&self, out: W) {
+        json::print(&self, out);
     }
 }
 
@@ -222,9 +223,10 @@ mod json {
     use crate::stats;
     use crate::stats::{Stats, StreamIntervalStats};
     use serde::{self, ser::SerializeStruct, Serialize, Serializer};
+    use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    pub(crate) fn print(stats: &Stats) {
+    pub(crate) fn print<W: Write>(stats: &Stats, out: W) {
         let report = Report {
             start: Start {
                 timestamp: stats.start,
@@ -236,7 +238,7 @@ mod json {
                 .collect(),
         };
 
-        println!("{}", serde_json::to_string(&report).unwrap());
+        serde_json::to_writer(out, &report).unwrap();
     }
 
     #[derive(Serialize)]

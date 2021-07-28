@@ -13,6 +13,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
 
 use perf::bind_socket;
+use std::fs::File;
 use std::ops::DerefMut;
 
 /// Connects to a QUIC perf server and maintains a specified pattern of requests until interrupted
@@ -58,9 +59,9 @@ struct Opt {
     /// Whether to print connection statistics
     #[structopt(long)]
     conn_stats: bool,
-    /// Whether to output JSON statistics
-    #[structopt(long)]
-    json: bool,
+    /// File path to output JSON statistics to. If the file is '-', stdout will be used
+    #[structopt(long, default_value = "")]
+    json: String,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -178,11 +179,9 @@ async fn run(opt: Opt) -> Result<()> {
                 let mut guard = stream_stats.lock().unwrap();
                 stats.on_interval(start, guard.deref_mut());
 
-                if !opt.json {
-                    stats.print();
-                    if opt.conn_stats {
-                        println!("{:?}\n", connection.stats());
-                    }
+                stats.print();
+                if opt.conn_stats {
+                    println!("{:?}\n", connection.stats());
                 }
             }
         }
@@ -203,8 +202,13 @@ async fn run(opt: Opt) -> Result<()> {
 
     endpoint.wait_idle().await;
 
-    if opt.json {
-        stats.print_json();
+    match opt.json.as_str() {
+        "-" => stats.print_json(std::io::stdout()),
+        path if path.len() > 0 => {
+            let file = File::create(path)?;
+            stats.print_json(file)
+        }
+        _ => {}
     }
 
     Ok(())
