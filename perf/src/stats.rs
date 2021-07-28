@@ -1,9 +1,8 @@
 use hdrhistogram::Histogram;
 use quinn::StreamId;
-use serde::{self, ser::SerializeStruct, Serialize, Serializer};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 pub struct Stats {
     /// Test start time
@@ -48,12 +47,10 @@ impl Stats {
 
         stream_stats.retain(|stream_stats| {
             self.record(stream_stats.clone());
-            interval.add_stream_stats(stream_stats.clone());
+            interval.record_stream_stats(stream_stats.clone());
             // Retain if not finished yet
             stream_stats.finished.load(Ordering::Relaxed) == false
         });
-
-        interval.finish();
 
         self.intervals.push(interval);
     }
@@ -121,16 +118,7 @@ impl Stats {
     }
 
     pub fn print_json(&self) {
-        println!(
-            "{}",
-            serde_json::to_string(&Report {
-                start: &Timestamp {
-                    timestamp: self.start
-                },
-                intervals: &self.intervals,
-            })
-            .unwrap()
-        );
+        json::print(&self);
     }
 }
 
@@ -175,8 +163,6 @@ impl StreamStats {
 
 struct Interval {
     streams: Vec<StreamIntervalStats>,
-    recv_stream_sum: StreamIntervalSumStats,
-    send_stream_sum: StreamIntervalSumStats,
     period: IntervalPeriod,
 }
 
@@ -190,127 +176,194 @@ impl Interval {
 
         Self {
             streams: vec![],
-            recv_stream_sum: StreamIntervalSumStats::new(period),
-            send_stream_sum: StreamIntervalSumStats::new(period),
             period,
         }
     }
 
-    fn add_stream_stats(&mut self, stream_stats: Arc<StreamStats>) {
+    fn record_stream_stats(&mut self, stream_stats: Arc<StreamStats>) {
         let bytes = stream_stats.bytes.swap(0, Ordering::Relaxed);
-        if stream_stats.sender {
-            self.send_stream_sum.bytes += bytes;
-        } else {
-            self.recv_stream_sum.bytes += bytes;
-        }
         self.streams.push(StreamIntervalStats {
-            id: stream_stats.id.0,
-            start: self.period.start,
-            end: self.period.end,
-            seconds: self.period.seconds,
+            id: stream_stats.id,
             bytes,
-            bits_per_second: bytes as f64 * 8.0 / self.period.seconds,
             sender: stream_stats.sender,
         })
     }
-
-    // Calculate throughput over the sum
-    fn finish(&mut self) {
-        self.recv_stream_sum.finish();
-        self.send_stream_sum.finish();
-    }
 }
 
-impl Serialize for Interval {
-    fn serialize<S>(&self, serializer: S) -> Result<<S as Serializer>::Ok, <S as Serializer>::Error>
-    where
-        S: Serializer,
-    {
-        let mut state = serializer.serialize_struct("Interval", 2)?;
-        state.serialize_field("streams", &self.streams)?;
-        // iperf3 outputs duplicate "sum" entries when run in bidirectional mode
-        // serde does not support duplicate keys, so only output one of the sums
-        if self.send_stream_sum.bytes > 0 {
-            state.serialize_field("sum", &self.send_stream_sum)?;
-        } else {
-            state.serialize_field("sum", &self.recv_stream_sum)?;
-        }
-        state.end()
-    }
-}
-
-#[derive(Copy, Clone, Serialize)]
 struct IntervalPeriod {
     start: f64,
     end: f64,
     seconds: f64,
 }
 
-#[derive(Serialize)]
 struct StreamIntervalStats {
-    id: u64,
-    start: f64,
-    end: f64,
-    seconds: f64,
+    id: StreamId,
     bytes: usize,
-    bits_per_second: f64,
     sender: bool,
-}
-
-#[derive(Serialize)]
-struct StreamIntervalSumStats {
-    bytes: usize,
-    start: f64,
-    end: f64,
-    seconds: f64,
-    bits_per_second: f64,
-    sender: bool,
-}
-
-impl StreamIntervalSumStats {
-    fn new(period: IntervalPeriod) -> Self {
-        Self {
-            bytes: 0,
-            start: period.start,
-            end: period.end,
-            seconds: period.seconds,
-            bits_per_second: 0.0,
-            sender: false,
-        }
-    }
-
-    fn finish(&mut self) {
-        self.bits_per_second = self.bytes as f64 * 8.0 / self.seconds
-    }
-}
-
-#[derive(Serialize)]
-struct Timestamp {
-    #[serde(serialize_with = "serialize_timestamp")]
-    timestamp: SystemTime,
-}
-
-fn serialize_timestamp<S>(time: &SystemTime, s: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    use serde::ser::SerializeMap;
-    let mut state = s.serialize_map(Some(1))?;
-    state.serialize_entry(
-        "timesecs",
-        &time.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-    )?;
-    state.end()
-}
-
-#[derive(Serialize)]
-struct Report<'a> {
-    start: &'a Timestamp,
-    intervals: &'a Vec<Interval>,
-    //end
 }
 
 fn throughput_bytes_per_second(duration_in_micros: u64, size: u64) -> f64 {
-    let through = (size as f64) / (duration_in_micros as f64 / 1000000.0);
-    through
+    (size as f64) / (duration_in_micros as f64 / 1000000.0)
 }
+
+mod json {
+    use crate::stats;
+    use crate::stats::{Stats, StreamIntervalStats};
+    use serde::{self, ser::SerializeStruct, Serialize, Serializer};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    pub(crate) fn print(stats: &Stats) {
+        let report = Report {
+            start: Start {
+                timestamp: stats.start,
+            },
+            intervals: &stats
+                .intervals
+                .iter()
+                .map(|interval| Interval::from_stats_interval(interval))
+                .collect(),
+        };
+
+        println!("{}", serde_json::to_string(&report).unwrap());
+    }
+
+    #[derive(Serialize)]
+    struct Report<'a> {
+        start: Start,
+        intervals: &'a Vec<Interval>,
+        // TODO: add end stats
+    }
+
+    #[derive(Serialize)]
+    struct Start {
+        #[serde(serialize_with = "serialize_timestamp")]
+        timestamp: SystemTime,
+    }
+
+    fn serialize_timestamp<S>(time: &SystemTime, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut state = s.serialize_map(Some(1))?;
+        state.serialize_entry(
+            "timesecs",
+            &time.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        )?;
+        state.end()
+    }
+
+    struct Interval {
+        streams: Vec<Stream>,
+        recv_sum: Sum,
+        send_sum: Sum,
+    }
+
+    impl Interval {
+        fn from_stats_interval(interval: &stats::Interval) -> Self {
+            Self {
+                streams: interval
+                    .streams
+                    .iter()
+                    .map(|stats| Stream::from_stream_interval_stats(stats, &interval.period))
+                    .collect(),
+                recv_sum: Sum::from_stream_interval_stats(
+                    &interval.streams,
+                    &interval.period,
+                    false,
+                ),
+                send_sum: Sum::from_stream_interval_stats(
+                    &interval.streams,
+                    &interval.period,
+                    true,
+                ),
+            }
+        }
+    }
+
+    impl Serialize for Interval {
+        fn serialize<S>(
+            &self,
+            serializer: S,
+        ) -> Result<<S as Serializer>::Ok, <S as Serializer>::Error>
+        where
+            S: Serializer,
+        {
+            let mut state = serializer.serialize_struct("Interval", 2)?;
+            state.serialize_field("streams", &self.streams)?;
+            // iperf3 outputs duplicate "sum" entries when run in bidirectional mode
+            // serde does not support duplicate keys, so only output one of the sums
+            if self.send_sum.bytes > 0 {
+                state.serialize_field("sum", &self.send_sum)?;
+            } else {
+                state.serialize_field("sum", &self.recv_sum)?;
+            }
+            state.end()
+        }
+    }
+
+    #[derive(Serialize)]
+    struct Stream {
+        id: u64,
+        start: f64,
+        end: f64,
+        seconds: f64,
+        bytes: usize,
+        bits_per_second: f64,
+        sender: bool,
+    }
+
+    impl Stream {
+        fn from_stream_interval_stats(
+            stats: &stats::StreamIntervalStats,
+            period: &stats::IntervalPeriod,
+        ) -> Self {
+            let bits_per_second = stats.bytes as f64 * 8.0 / period.seconds;
+
+            Self {
+                id: stats.id.0,
+                start: period.start,
+                end: period.end,
+                seconds: period.seconds,
+                bytes: stats.bytes,
+                bits_per_second,
+                sender: stats.sender,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct Sum {
+        start: f64,
+        end: f64,
+        seconds: f64,
+        bytes: usize,
+        bits_per_second: f64,
+        sender: bool,
+    }
+
+    impl Sum {
+        fn from_stream_interval_stats(
+            stats: &Vec<StreamIntervalStats>,
+            period: &stats::IntervalPeriod,
+            sender: bool,
+        ) -> Self {
+            let bytes = stats
+                .iter()
+                .filter(|stat| stat.sender == sender)
+                .map(|stat| stat.bytes)
+                .sum();
+            let bits_per_second = bytes as f64 * 8.0 / period.seconds;
+
+            Self {
+                start: period.start,
+                end: period.end,
+                seconds: period.seconds,
+                bytes,
+                bits_per_second,
+                sender,
+            }
+        }
+    }
+}
+
