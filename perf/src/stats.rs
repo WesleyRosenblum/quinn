@@ -49,15 +49,15 @@ impl Stats {
             self.record(stream_stats.clone());
             interval.record_stream_stats(stream_stats.clone());
             // Retain if not finished yet
-            stream_stats.finished.load(Ordering::Relaxed) == false
+            stream_stats.finished.load(Ordering::SeqCst) == false
         });
 
         self.intervals.push(interval);
     }
 
     fn record(&mut self, stream_stats: Arc<StreamStats>) {
-        if stream_stats.finished.load(Ordering::Relaxed) {
-            let duration = stream_stats.duration.load(Ordering::Relaxed) as u64;
+        if stream_stats.finished.load(Ordering::SeqCst) {
+            let duration = stream_stats.duration.load(Ordering::SeqCst) as u64;
             let bps = throughput_bytes_per_second(duration, stream_stats.request_size);
 
             if stream_stats.sender {
@@ -67,7 +67,7 @@ impl Stats {
                 self.download_throughput.record(bps as u64).unwrap();
                 self.download_duration.record(duration).unwrap();
                 self.fbl
-                    .record(stream_stats.first_byte_latency.load(Ordering::Relaxed) as u64)
+                    .record(stream_stats.first_byte_latency.load(Ordering::SeqCst) as u64)
                     .unwrap();
                 self.requests += 1;
             }
@@ -159,17 +159,17 @@ impl StreamStats {
 
     pub fn on_first_byte(&self, latency: Duration) {
         self.first_byte_latency
-            .store(latency.as_micros() as u64, Ordering::Relaxed);
+            .store(latency.as_micros() as u64, Ordering::SeqCst);
     }
 
     pub fn on_bytes(&self, bytes: usize) {
-        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::SeqCst);
     }
 
     pub fn finish(&self, duration: Duration) {
         self.duration
-            .store(duration.as_micros() as u64, Ordering::Relaxed);
-        self.finished.store(true, Ordering::Relaxed);
+            .store(duration.as_micros() as u64, Ordering::SeqCst);
+        self.finished.store(true, Ordering::SeqCst);
     }
 }
 
@@ -193,7 +193,7 @@ impl Interval {
     }
 
     fn record_stream_stats(&mut self, stream_stats: Arc<StreamStats>) {
-        let bytes = stream_stats.bytes.swap(0, Ordering::Relaxed);
+        let bytes = stream_stats.bytes.swap(0, Ordering::SeqCst);
         self.streams.push(StreamIntervalStats {
             id: stream_stats.id,
             bytes,
