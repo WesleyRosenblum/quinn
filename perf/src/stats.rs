@@ -1,0 +1,316 @@
+use hdrhistogram::Histogram;
+use quinn::StreamId;
+use serde::{self, ser::SerializeStruct, Serialize, Serializer};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+pub struct Stats {
+    /// Test start time
+    start_instant: Instant,
+    /// Test start system time
+    start: SystemTime,
+    /// Durations of uploads
+    upload_duration: Histogram<u64>,
+    /// Durations of downloads
+    download_duration: Histogram<u64>,
+    /// Time from finishing the upload until receiving the first byte of the response
+    fbl: Histogram<u64>,
+    /// Throughput for uploads
+    upload_throughput: Histogram<u64>,
+    /// Throughput for downloads
+    download_throughput: Histogram<u64>,
+    /// The total amount of requests executed
+    requests: usize,
+    /// Stats accumulated over each interval
+    intervals: Vec<Interval>,
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        Self {
+            start_instant: Instant::now(),
+            start: SystemTime::now(),
+            upload_duration: Histogram::new(3).unwrap(),
+            download_duration: Histogram::new(3).unwrap(),
+            fbl: Histogram::new(3).unwrap(),
+            upload_throughput: Histogram::new(3).unwrap(),
+            download_throughput: Histogram::new(3).unwrap(),
+            requests: 0,
+            intervals: vec![],
+        }
+    }
+}
+
+impl Stats {
+    pub fn on_interval(&mut self, start: Instant, stream_stats: &mut Vec<Arc<StreamStats>>) {
+        let mut interval = Interval::new(start - self.start_instant, self.start_instant.elapsed());
+
+        stream_stats.retain(|stream_stats| {
+            self.record(stream_stats.clone());
+            interval.add_stream_stats(stream_stats.clone());
+            // Retain if not finished yet
+            stream_stats.finished.load(Ordering::Relaxed) == false
+        });
+
+        interval.finish();
+
+        self.intervals.push(interval);
+    }
+
+    fn record(&mut self, stream_stats: Arc<StreamStats>) {
+        if stream_stats.finished.load(Ordering::Relaxed) {
+            let duration = stream_stats.duration.load(Ordering::Relaxed) as u64;
+            let bps = throughput_bytes_per_second(duration, stream_stats.request_size);
+
+            if stream_stats.sender {
+                self.upload_throughput.record(bps as u64).unwrap();
+                self.upload_duration.record(duration).unwrap();
+            } else {
+                self.download_throughput.record(bps as u64).unwrap();
+                self.download_duration.record(duration).unwrap();
+                self.fbl
+                    .record(stream_stats.first_byte_latency.load(Ordering::Relaxed) as u64)
+                    .unwrap();
+                self.requests += 1;
+            }
+        }
+    }
+
+    pub fn print(&self) {
+        let dt = self.start_instant.elapsed();
+        let rps = self.requests as f64 / dt.as_secs_f64();
+
+        println!("Overall stats:");
+        println!(
+            "RPS: {:.2} ({} requests in {:4.2?})",
+            rps, self.requests, dt,
+        );
+        println!();
+
+        println!("Stream metrics:\n");
+
+        println!("      │ Upload Duration │ Download Duration | FBL        | Upload Throughput | Download Throughput");
+        println!("──────┼─────────────────┼───────────────────┼────────────┼───────────────────┼────────────────────");
+
+        let print_metric = |label: &'static str, get_metric: fn(&Histogram<u64>) -> u64| {
+            println!(
+                " {} │ {:>15} │ {:>17} │  {:>9} │ {:11.2} MiB/s │ {:13.2} MiB/s",
+                label,
+                format!(
+                    "{:.2?}",
+                    Duration::from_micros(get_metric(&self.upload_duration))
+                ),
+                format!(
+                    "{:.2?}",
+                    Duration::from_micros(get_metric(&self.download_duration))
+                ),
+                format!("{:.2?}", Duration::from_micros(get_metric(&self.fbl))),
+                get_metric(&self.upload_throughput) as f64 / 1024.0 / 1024.0,
+                get_metric(&self.download_throughput) as f64 / 1024.0 / 1024.0,
+            );
+        };
+
+        print_metric("AVG ", |hist| hist.mean() as u64);
+        print_metric("P0  ", |hist| hist.value_at_quantile(0.00));
+        print_metric("P10 ", |hist| hist.value_at_quantile(0.10));
+        print_metric("P50 ", |hist| hist.value_at_quantile(0.50));
+        print_metric("P90 ", |hist| hist.value_at_quantile(0.90));
+        print_metric("P100", |hist| hist.value_at_quantile(1.00));
+        println!();
+    }
+
+    pub fn print_json(&self) {
+        println!(
+            "{}",
+            serde_json::to_string(&Report {
+                start: &Timestamp {
+                    timestamp: self.start
+                },
+                intervals: &self.intervals,
+            })
+            .unwrap()
+        );
+    }
+}
+
+pub struct StreamStats {
+    id: StreamId,
+    request_size: u64,
+    bytes: AtomicUsize,
+    sender: bool,
+    finished: AtomicBool,
+    duration: AtomicU64,
+    first_byte_latency: AtomicU64,
+}
+
+impl StreamStats {
+    pub fn new(id: StreamId, request_size: u64, sender: bool) -> Self {
+        Self {
+            id,
+            request_size,
+            bytes: Default::default(),
+            sender,
+            finished: Default::default(),
+            duration: Default::default(),
+            first_byte_latency: Default::default(),
+        }
+    }
+
+    pub fn on_first_byte(&self, latency: Duration) {
+        self.first_byte_latency
+            .store(latency.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    pub fn on_bytes(&self, bytes: usize) {
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn finish(&self, duration: Duration) {
+        self.duration
+            .store(duration.as_micros() as u64, Ordering::Relaxed);
+        self.finished.store(true, Ordering::Relaxed);
+    }
+}
+
+struct Interval {
+    streams: Vec<StreamIntervalStats>,
+    recv_stream_sum: StreamIntervalSumStats,
+    send_stream_sum: StreamIntervalSumStats,
+    period: IntervalPeriod,
+}
+
+impl Interval {
+    fn new(start: Duration, end: Duration) -> Self {
+        let period = IntervalPeriod {
+            start: start.as_secs_f64(),
+            end: end.as_secs_f64(),
+            seconds: (end - start).as_secs_f64(),
+        };
+
+        Self {
+            streams: vec![],
+            recv_stream_sum: StreamIntervalSumStats::new(period),
+            send_stream_sum: StreamIntervalSumStats::new(period),
+            period,
+        }
+    }
+
+    fn add_stream_stats(&mut self, stream_stats: Arc<StreamStats>) {
+        let bytes = stream_stats.bytes.swap(0, Ordering::Relaxed);
+        if stream_stats.sender {
+            self.send_stream_sum.bytes += bytes;
+        } else {
+            self.recv_stream_sum.bytes += bytes;
+        }
+        self.streams.push(StreamIntervalStats {
+            id: stream_stats.id.0,
+            start: self.period.start,
+            end: self.period.end,
+            seconds: self.period.seconds,
+            bytes,
+            bits_per_second: bytes as f64 * 8.0 / self.period.seconds,
+            sender: stream_stats.sender,
+        })
+    }
+
+    // Calculate throughput over the sum
+    fn finish(&mut self) {
+        self.recv_stream_sum.finish();
+        self.send_stream_sum.finish();
+    }
+}
+
+impl Serialize for Interval {
+    fn serialize<S>(&self, serializer: S) -> Result<<S as Serializer>::Ok, <S as Serializer>::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("Interval", 2)?;
+        state.serialize_field("streams", &self.streams)?;
+        // iperf3 outputs duplicate "sum" entries when run in bidirectional mode
+        // serde does not support duplicate keys, so only output one of the sums
+        if self.send_stream_sum.bytes > 0 {
+            state.serialize_field("sum", &self.send_stream_sum)?;
+        } else {
+            state.serialize_field("sum", &self.recv_stream_sum)?;
+        }
+        state.end()
+    }
+}
+
+#[derive(Copy, Clone, Serialize)]
+struct IntervalPeriod {
+    start: f64,
+    end: f64,
+    seconds: f64,
+}
+
+#[derive(Serialize)]
+struct StreamIntervalStats {
+    id: u64,
+    start: f64,
+    end: f64,
+    seconds: f64,
+    bytes: usize,
+    bits_per_second: f64,
+    sender: bool,
+}
+
+#[derive(Serialize)]
+struct StreamIntervalSumStats {
+    bytes: usize,
+    start: f64,
+    end: f64,
+    seconds: f64,
+    bits_per_second: f64,
+    sender: bool,
+}
+
+impl StreamIntervalSumStats {
+    fn new(period: IntervalPeriod) -> Self {
+        Self {
+            bytes: 0,
+            start: period.start,
+            end: period.end,
+            seconds: period.seconds,
+            bits_per_second: 0.0,
+            sender: false,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.bits_per_second = self.bytes as f64 * 8.0 / self.seconds
+    }
+}
+
+#[derive(Serialize)]
+struct Timestamp {
+    #[serde(serialize_with = "serialize_timestamp")]
+    timestamp: SystemTime,
+}
+
+fn serialize_timestamp<S>(time: &SystemTime, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let mut state = s.serialize_map(Some(1))?;
+    state.serialize_entry(
+        "timesecs",
+        &time.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+    )?;
+    state.end()
+}
+
+#[derive(Serialize)]
+struct Report<'a> {
+    start: &'a Timestamp,
+    intervals: &'a Vec<Interval>,
+    //end
+}
+
+fn throughput_bytes_per_second(duration_in_micros: u64, size: u64) -> f64 {
+    let through = (size as f64) / (duration_in_micros as f64 / 1000000.0);
+    through
+}
