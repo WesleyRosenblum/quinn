@@ -133,12 +133,24 @@ pub struct StreamStats {
 }
 
 impl StreamStats {
-    pub fn new(id: StreamId, request_size: u64, sender: bool) -> Self {
+    pub fn new_sender(id: StreamId, upload_size: u64) -> Self {
         Self {
             id,
-            request_size,
+            request_size: upload_size,
             bytes: Default::default(),
-            sender,
+            sender: true,
+            finished: Default::default(),
+            duration: Default::default(),
+            first_byte_latency: Default::default(),
+        }
+    }
+
+    pub fn new_receiver(id: StreamId, download_size: u64) -> Self {
+        Self {
+            id,
+            request_size: download_size,
+            bytes: Default::default(),
+            sender: false,
             finished: Default::default(),
             duration: Default::default(),
             first_byte_latency: Default::default(),

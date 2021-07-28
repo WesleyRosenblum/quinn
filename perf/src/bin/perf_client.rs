@@ -227,7 +227,7 @@ async fn drain_stream(
         Bytes::new(), Bytes::new(), Bytes::new(), Bytes::new(),
     ];
     let download_start = Instant::now();
-    let recv_stream_stats = Arc::new(StreamStats::new(stream.id(), download, false));
+    let recv_stream_stats = Arc::new(StreamStats::new_receiver(stream.id(), download));
     stream_stats.lock().unwrap().push(recv_stream_stats.clone());
 
     let mut first_byte = true;
@@ -309,7 +309,7 @@ async fn request(
         return Ok(());
     }
 
-    let send_stream_stats = Arc::new(StreamStats::new(send.id(), upload, true));
+    let send_stream_stats = Arc::new(StreamStats::new_sender(send.id(), upload));
     stream_stats.lock().unwrap().push(send_stream_stats.clone());
 
     const DATA: [u8; 1024 * 1024] = [42; 1024 * 1024];
