@@ -60,8 +60,8 @@ struct Opt {
     #[structopt(long)]
     conn_stats: bool,
     /// File path to output JSON statistics to. If the file is '-', stdout will be used
-    #[structopt(long, default_value = "")]
-    json: String,
+    #[structopt(long)]
+    json: Option<String>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -202,9 +202,9 @@ async fn run(opt: Opt) -> Result<()> {
 
     endpoint.wait_idle().await;
 
-    match opt.json.as_str() {
-        "-" => stats.print_json(std::io::stdout()),
-        path if path.len() > 0 => {
+    match opt.json.as_deref() {
+        Some("-") => stats.print_json(std::io::stdout()),
+        Some(path) if path.len() > 0 => {
             let file = File::create(path)?;
             stats.print_json(file)
         }
