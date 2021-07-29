@@ -4,8 +4,6 @@ use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
 use tracing::warn;
 
-pub mod stats;
-
 pub fn bind_socket(
     addr: SocketAddr,
     send_buffer_size: usize,
